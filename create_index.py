@@ -14,11 +14,6 @@ BASE_PATH = "data"
 MODELS_PATH = f"{BASE_PATH}/allmodels/model"
 DEEPINDEX_PATH = f"{BASE_PATH}/deepindex_science"
 
-def parse_page(minlin, maxlen, ):
-    pass
-
-
-
 def make_passages():
     from pathlib import Path
     science_pages = json.load(open('science_pages.json'))

@@ -1,4 +1,5 @@
 import glob
+import random
 
 import numpy as np
 import pandas as pd
@@ -8,12 +9,8 @@ import json
 import re
 from sentence_transformers import SentenceTransformer, util
 
-torch.set_num_threads(8)
-torch.inference_mode()
-torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16)
-torch.backends.cuda.sdp_kernel(enable_flash=True,
-                               enable_math=False,
-                               enable_mem_efficient=True)
+torch.set_default_device('cuda:0')
+# torch.set_num_threads(8)
 
 ABCDE = 'ABCDE'
 PROMPT = 'prompt'
@@ -51,19 +48,18 @@ def load_embeddings(embeddings_path):
     # embeddings are sharded into chunks of 128k
     # each shard takes ~100MB in memory
     batch_size = 20
-    num_steps = len(files) // batch_size + 1
+    num_steps = int(np.ceil(len(files)/batch_size))
     print("Num steps", num_steps)
 
     for batch_idx in range(num_steps):
         fs = files[batch_idx*batch_size: batch_size*(batch_idx+1)]
-
         corpus_embeddings = np.vstack([np.load(f) for f in fs])
         corpus_embeddings = torch.from_numpy(corpus_embeddings).half().cuda()
         yield corpus_embeddings
 
 
 def get_encoder(model_dir):
-    encoder = SentenceTransformer(model_dir)
+    encoder = SentenceTransformer(model_dir, device='cuda:0')
     encoder.max_seq_length = 512
     return encoder
 
@@ -128,7 +124,8 @@ def retrieve(samples, embeddings_npy, passages_jsonl, model_dir, top_k=5):
 
     # get text of passages
     passages = {}
-    with open(passages_jsonl) as f:
+    import gzip
+    with gzip.open(passages_jsonl) as f:
         # json parsing is costly
         # so we use line number as a proxy for id
         idx = 0
@@ -211,7 +208,7 @@ def rerank(samples, model_dir):
 def retrieve_and_rerank(samples, tmp_dir):
     samples = retrieve(samples=samples,
              model_dir="data/allmodels/model/bge-small-en",
-             passages_jsonl="data/deepindex_all_paras/passages.jsonl",
+             passages_jsonl="data/deepindex_all_paras/passages.jsonl.gz",
              embeddings_npy="data/deepindex_all_paras/*.npy")
 
     json.dump(samples, open(f"{tmp_dir}/retrieval.json", 'w'), indent=True)
@@ -226,7 +223,10 @@ def retrieve_and_rerank(samples, tmp_dir):
 def create_question_prompt(sample, add_unsure=False):
     prompt = "Based on above information answer the following question:"
     question = f"Question : {sample[PROMPT]}"
-    answers = [f"\t{c}: {sample[c]}" for c in ABCDE]
+    abcde_s = [c for c in ABCDE]
+    # abcde_s = abcde_s[1:] + abcde_s[:1]
+    # random.shuffle(abcde_s)
+    answers = [f"\t{c}: {sample[c]}" for c in abcde_s]
 
     if add_unsure:
         answers.append("\tF: More information is required to answer this question correctly")
@@ -237,7 +237,13 @@ def create_question_prompt(sample, add_unsure=False):
 
 
 def vicuna_prompt(prompt, expertise='science and technology'):
-    user = f"""You are an expert in {expertise}. Help the user answer their question.\n\nUSER: {prompt}\n"""
+    user = f"""You are an expert in {expertise}. \
+You will be given some paragraphs from wikipedia and a question related to it. \
+You have to chose one option from A,B,C,D,E. \
+Only one of the options is correct. \
+Sometimes the options are very close to each other. \
+All options will look like the correct option but would have some variation that would make them incorrect.
+\nUSER: {prompt}\n"""
     assistant = """ASSISTANT: The correct choice in json format is:""" + '{"correct choice":"'
     return user + assistant
 
@@ -257,6 +263,7 @@ def tournament(all_choices):
 
     return winners
 
+
 def is_bad_passage(passage):
     words = passage.split(" ")
     lines = passage.split("\n")
@@ -269,7 +276,8 @@ def is_bad_passage(passage):
     #     print(len(lines))
     return isbad
 
-def make_prompt(sample):
+
+def make_prompt(sample, llm, max_tokens=2048):
     passages = sample[TIER_2_PASSAGES]
 
     experts = {}
@@ -283,7 +291,16 @@ def make_prompt(sample):
     for idx, expertise in enumerate(experts):
         information = experts[expertise]
         information = ".".join(information)
+        information = information.replace("\n", " ")
         openbook += f"""{idx}. {expertise}: {information}\n"""
+
+    # print(openbook)
+    # print("--------------------")
+    openbook_tokens = llm.tokenizer.encode(openbook)
+    openbook_tokens = openbook_tokens[:max_tokens]
+    openbook = llm.tokenizer.decode(openbook_tokens)
+    # print(openbook)
+    # print("========================")
 
     expertise = ",".join(list(experts.keys()))
 
@@ -315,15 +332,22 @@ def permute(sample, order):
     sample[ANSWER] = new_correct_answer
     return sample
 
+
 def apply_permutation(l, p):
     ln = [l[i] for i in p]
     return ln
 
+
 def make_choices(samples):
-    from llm import GPTQLLM, GGMLLLM
+    from llm import GPTQLLM
     from train_utils import apk
 
     llm = GPTQLLM("data/allmodels/model/vicuna13b16k432/")
+    # llm = GPTQLLM("TheBloke/openchat_v3.2_super-GPTQ")
+    # llm = GPTQLLM("TheBloke/CodeLlama-13B-Instruct-GPTQ")
+    # llm = GPTQLLM("microsoft/phi-1_5")
+    # llm = GPTQLLM("TheBloke/CodeLlama-34B-Instruct-GPTQ")
+    # llm = GPTQLLM("TheBloke/vicuna-7B-v1.5-16K-GPTQ")
 
     apks_3 = []
     apks_1 = []
@@ -331,11 +355,14 @@ def make_choices(samples):
     for sample in tqdm(samples):
         # print("===========================")
         answer_scores = {}
-        for run in range(5):
+        for run in range(1):
+        # for run in [-1, 1]:
             # print("-----")
             # Create a shift permutation by rotating the array
             order = list(range(len(ABCDE)))
             order = order[run:] + order[:run]
+            # order = order[::run]
+            # print(order)
             inverse_order = inverse_permutation(order)
 
             # What has abcde become now ?
@@ -344,12 +371,13 @@ def make_choices(samples):
 
             # apply the permutation to sample
             sample = permute(sample, order)
-            prompt = make_prompt(sample)
+            prompt = make_prompt(sample, llm, max_tokens=1536)
             # print(prompt)
             choices = llm.process(prompt)
             torch.cuda.empty_cache()
 
             # if sample[ANSWER] != choices[0][1]:
+            #     print(sample['id'])
             #     print(prompt)
             #     print(choices)
             #     print(sample[ANSWER])
@@ -377,15 +405,25 @@ def make_choices(samples):
     print(sum(apks_1) / len(apks_1))
     print(sum(apks_3) / len(apks_3))
 
-data_df = pd.read_csv("data/extra/openai_questions_kaggle/6000_wiki_en_sci_questions_with_excerpts.csv")
 
+# data_df = pd.read_csv("data/extra/1000_science.csv")
 # data_df = pd.read_csv("data/kaggle-llm-science-exam/train.csv")
-# data = data_df.to_dict(orient='records')
+# data_df = pd.read_csv("data/extra/openai_questions_kaggle/6000_wiki_en_sci_questions_with_excerpts.csv")
+data_df = pd.read_csv("data/extra/openai_questions_kaggle/6000_all_categories_questions_with_excerpts.csv")
+
+data_df.fillna("None of the above", inplace=True)
+data = data_df.to_dict(orient='records')
 # data = data[0:200]
+# #
+tmp_dir = "working_6k_nonsci"
+# tmp_dir = "working"
 #
-tmp_dir = "working_6k"
+data = retrieve_and_rerank(data, tmp_dir=tmp_dir)
+# data = json.load(open(f"{tmp_dir}/reranked.json"))
+# # data = data[0:200]
 #
-# data = retrieve_and_rerank(data, tmp_dir=tmp_dir)
-data = json.load(open(f"{tmp_dir}/reranked.json"))
-data = data[0:200]
-make_choices(data)
+# with (torch.inference_mode(),
+#     torch.backends.cuda.sdp_kernel(enable_flash=True,
+#                                enable_math=False,
+#                                enable_mem_efficient=True)):
+#     make_choices(data)

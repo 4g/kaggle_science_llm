@@ -1,3 +1,5 @@
+import glob
+
 import torch
 torch.set_num_threads(4)
 
@@ -12,7 +14,7 @@ import jsonlines
 
 BASE_PATH = "data"
 MODELS_PATH = f"{BASE_PATH}/allmodels/model"
-DEEPINDEX_PATH = f"{BASE_PATH}/deepindex_science"
+DEEPINDEX_PATH = f"{BASE_PATH}/deepindex_all_paras"
 
 def make_passages():
     from pathlib import Path
@@ -36,31 +38,35 @@ def make_passages():
             text = elem.text
             process_title = title.lower().replace(" ", "_")
 
-            if process_title not in science_pages:
-                continue
+            # if process_title not in science_pages:
+            #     continue
 
-            parts = text.split("\n")\
+            parts = text.split("\n\n")
 
             passages = []
             passage = []
             maxlen = 512
 
-            for part in parts:
-                words = part.strip().split() + ["\n"]
-                if len(words) < 30:
-                    continue
+            # for part in parts:
+            #     words = part.strip().split() + ["\n"]
+            #     if len(words) < 30:
+            #         continue
+            #
+            #     if len(words) + len(passage) < maxlen:
+            #         passage.extend(words)
+            #     else:
+            #         passages.append(passage)
+            #         passage = words
 
-                if len(words) + len(passage) < maxlen:
-                    passage.extend(words)
-                else:
-                    passages.append(passage)
-                    passage = words
+            # if len(passage) > 0:
+            #     passages.append(passage)
 
-            if len(passage) > 0:
-                passages.append(passage)
+            passages = parts
 
             for passage in passages:
-                passage = " ".join(passage).strip().replace("\n\n","\n").strip()
+                words = passage.replace("\n", " ").split()
+                if len(words) < 30:
+                    continue
                 x = {"passage": passage, "title": title, "idx": n_passages}
                 x = json.dumps(x)
                 fhandle.write(x + "\n")
@@ -109,9 +115,21 @@ def make_index():
             batch_embeddings = batch_embeddings.detach().cpu().numpy().astype(np.float16)
             np.save(f"{DEEPINDEX_PATH}/embeddings_{batch_idx}.npy", batch_embeddings)
 
+def join_npy():
+    files = glob.glob(f"{DEEPINDEX_PATH}/embeddings_*.npy")
+    files = sorted(files, key=lambda x:int(x.split(".")[0].split("_")[-1]))
+    arrays = []
+    for f in files:
+        x = np.load(f)
+        arrays.append(x)
+
+    arrays = np.vstack(arrays)
+    np.save(f"{DEEPINDEX_PATH}/corpus_embeddings.npy", arrays)
+
 def main():
-    make_passages()
-    make_index()
+    # make_passages()
+    # make_index()
+    join_npy()
 
 if __name__ == "__main__":
     main()

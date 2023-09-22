@@ -1,267 +1,58 @@
-import glob
-import random
+import json
+import os
+
+import pandas as pd
+from datasets import load_dataset
 
 import numpy as np
-import pandas as pd
+from dataclasses import dataclass
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase, PaddingStrategy
+from typing import Optional, Union
 import torch
-from tqdm import tqdm
-import json
-import re
-from sentence_transformers import SentenceTransformer, util
 
-torch.set_default_device('cuda:0')
-# torch.set_num_threads(8)
+from transformers import AutoTokenizer
+from transformers import AutoModelForMultipleChoice, TrainingArguments, Trainer
+from retrieval import retrieve_and_rerank
 
-ABCDE = 'ABCDE'
-PROMPT = 'prompt'
-ANSWER = 'answer'
+ABCDE = "ABCDE"
 
-TIER_1_QUESTION_EMBEDDINGS = "embeddings"
-TIER_1_QUERIES = 'tier_1_queries'
-TIER_1_HITS = 'tier_1_hits'
-TIER_2_HITS = 'tier_2_hits'
-
-TIER_1_PASSAGES = 'tier_1_passages'
-TIER_2_PASSAGES = 'tier_2_passages'
-
-PASSAGE = 'passage'
-TITLE = 'title'
-CORPUS_ID = 'corpus_id'
-SCORE = 'score'
-
-LLM_PROMPT = 'llm_prompt'
-LLM_RESPONSE = 'llm_response'
+model_path = "deberta_ft/"
+tokenizer = AutoTokenizer.from_pretrained(model_path)
 
 
-def embed(encoder, strings):
-    question_embeddings = encoder.encode(strings, normalize_embeddings=True, convert_to_tensor=True).half()
-    return question_embeddings
+def make_dataset(reranked_json, dataset_path):
+    columns = ['prompt', 'A', 'C', 'B', 'D', 'E', 'answer', 'tier_2_passages']
+
+    validation = [reranked_json]
+
+    val_dfs = [pd.DataFrame.from_records(json.load(open(f))) for f in validation]
+    val_df = pd.concat(val_dfs)
+    val_df = val_df[columns]
+    val_df.to_csv(dataset_path, index=False)
 
 
-def load_embeddings(embeddings_path):
-    files = glob.glob(embeddings_path)
-    f_to_int = lambda x : int(re.findall(r'\d+', x)[0])
-    files = sorted(files, key=f_to_int)
-    print(f"{len(files)} embedding shards found {files[0]} ... {files[-1]}")
+def preprocess_function(examples):
+    ending_names = [str(i) for i in range(5)]
+    first_sentences = [[context] * 5 for context in examples["context"]]
 
-    # For a larger gpu memory increase the batch size
-    # embeddings are sharded into chunks of 128k
-    # each shard takes ~100MB in memory
-    batch_size = 20
-    num_steps = int(np.ceil(len(files)/batch_size))
-    print("Num steps", num_steps)
+    question_headers = examples["prompt"]
+    second_sentences = [
+        [f"{header} {examples[end][i]}" for end in ending_names] for i, header in enumerate(question_headers)
+    ]
 
-    for batch_idx in range(num_steps):
-        fs = files[batch_idx*batch_size: batch_size*(batch_idx+1)]
-        corpus_embeddings = np.vstack([np.load(f) for f in fs])
-        corpus_embeddings = torch.from_numpy(corpus_embeddings).half().cuda()
-        yield corpus_embeddings
+    first_sentences = sum(first_sentences, [])
+    second_sentences = sum(second_sentences, [])
+
+    tokenized_examples = tokenizer(first_sentences, second_sentences, truncation=True)
+    return {k: [v[i: i + 5] for i in range(0, len(v), 5)] for k, v in tokenized_examples.items()}
 
 
-def get_encoder(model_dir):
-    encoder = SentenceTransformer(model_dir, device='cuda:0')
-    encoder.max_seq_length = 512
-    return encoder
-
-
-def retrieve(samples, embeddings_npy, passages_jsonl, model_dir, top_k=5):
-    """
-    samples : list of dicts. Must have keys ABCDE and prompt
-    """
-    encoder = get_encoder(model_dir)
-    # Retrieval. Gets sections of wikipedia articles
-    # These will be split and reranked later
-    for sample in tqdm(samples, desc="preparing queries ... "):
-        # We retrieve docs that match very well with either of:
-        # 1. just question
-        # 2. question + one answer
-        # 3. question + all answers
-
-        only_question = ["Represent this sentence for searching relevant passages:" + sample['prompt']]
-        questions_with_one_answer = [f"{sample[PROMPT]} {sample[c]}" for c in ABCDE]
-        question_with_all_answers = [f"{sample[PROMPT]}" + " ".join([sample[c] for c in ABCDE])]
-        questions = questions_with_one_answer \
-                    + question_with_all_answers \
-                    + only_question
-
-        question_embeddings = embed(encoder, questions)
-        sample[TIER_1_QUERIES] = questions
-        sample[TIER_1_QUESTION_EMBEDDINGS] = question_embeddings
-
-    offset = 0
-    for corpus_embeddings_shard in tqdm(load_embeddings(embeddings_npy), desc="retrieving ..."):
-        for sample in samples:
-            question_embeddings = sample[TIER_1_QUESTION_EMBEDDINGS]
-            # we use only top result,
-            # but let's retrieve 5 for debugging
-            tier_1_hits = util.semantic_search(question_embeddings,
-                                        corpus_embeddings_shard,
-                                        top_k=top_k,
-                                        score_function=util.dot_score)
-
-            for hits in tier_1_hits:
-                for hit in hits:
-                    hit[CORPUS_ID] += offset
-
-            # Merge with previous hits and keep top_k
-            if TIER_1_HITS in sample:
-                for idx, hits in enumerate(tier_1_hits):
-                    hits = tier_1_hits[idx] + sample[TIER_1_HITS][idx]
-                    hits = sorted(hits, key=lambda x: x[SCORE], reverse=True)[:top_k]
-                    tier_1_hits[idx] = hits
-
-            sample[TIER_1_HITS] = tier_1_hits
-
-        offset += len(corpus_embeddings_shard)
-
-    # get all ids that were hit
-    # we will load only these passages
-    hitids = set()
-    for sample in samples:
-        tier_1_hits = sample[TIER_1_HITS]
-        ids = [h[CORPUS_ID] for hits in tier_1_hits for h in hits]
-        hitids.update(ids)
-
-    # get text of passages
-    passages = {}
-    import gzip
-    with gzip.open(passages_jsonl) as f:
-        # json parsing is costly
-        # so we use line number as a proxy for id
-        idx = 0
-        for line in tqdm(f, "Loading text of matching paragraphs ..."):
-            if idx in hitids:
-                line = json.loads(line.strip())
-                passages[idx] = line
-            idx += 1
-
-    # add text to samples
-    for sample in tqdm(samples, 'adding text to samples ...'):
-        tier_1_hits = sample[TIER_1_HITS]
-        sample_passages = []
-        # there are multiple hits per sample
-        # iterate through each and store each hits passages separately.(for easy debug)
-        for hits in tier_1_hits:
-            ids = [h[CORPUS_ID] for h in hits]
-            q_passages = [passages[_id] for _id in ids]
-            sample_passages.append(q_passages)
-
-        sample[TIER_1_PASSAGES] = sample_passages
-
-    for sample in samples:
-        del sample[TIER_1_QUESTION_EMBEDDINGS]
-
-    # TODO : This is big
-    # passages are repeated across hits
-    return samples
-
-
-def rerank(samples, model_dir):
-    # rerank model can be different than retrieval model
-    encoder = get_encoder(model_dir)
-
-    # This is a post retrieval stage
-    # each sample should have TIER_1 retrieval results
-    for sample in tqdm(samples, "reranking ... "):
-        questions = sample[TIER_1_QUERIES]
-        passages = sample[TIER_1_PASSAGES]
-
-        # Wikipedia has awesome chunking
-        # Tier 1 retrieves full sections
-        # In Tier 2 we split those sections into paragraphs
-        # Then rerank them. This gives us a very small and concise paragraph of context
-        # Here we split the sections
-        split_passages = []
-        split_titles = []
-        top_passages = {}
-        for q_passages in passages:
-            for top_passage in q_passages[0:2]:
-                top_passages[top_passage['idx']] = top_passage
-
-        for top_passage in top_passages.values():
-            splits = top_passage[PASSAGE].split(".\n")
-            split_passages.extend(splits)
-            split_titles.extend([top_passage[TITLE]]*len(splits))
-
-        # print(len(split_passages), len(questions))
-
-        # Now that we have split the sections into paragraphs
-        # Score each paragraph as before against every question
-        # For simplicity questions are kept same as retr. but can be different
-
-        passage_embeddings = embed(encoder=encoder, strings=split_passages)
-        question_embeddings = embed(encoder=encoder, strings=questions)
-        scores = question_embeddings @ passage_embeddings.T
-        scores = scores.detach().cpu().numpy()
-
-        ranks = np.argsort(-scores, axis=1)[:, 0:1]
-        ranks = ranks.tolist()
-        ranks = [i for r in ranks for i in r]
-        ranks = set(ranks)
-
-        chosen_splits = [{PASSAGE: split_passages[i], TITLE: split_titles[i]} for i in ranks]
-        sample[TIER_2_PASSAGES] = chosen_splits
-
-    return samples
-
-
-def retrieve_and_rerank(samples, tmp_dir):
-    samples = retrieve(samples=samples,
-             model_dir="data/allmodels/model/bge-small-en",
-             passages_jsonl="data/deepindex_all_paras/passages.jsonl.gz",
-             embeddings_npy="data/deepindex_all_paras/*.npy")
-
-    json.dump(samples, open(f"{tmp_dir}/retrieval.json", 'w'), indent=True)
-
-    samples = json.load(open(f"{tmp_dir}/retrieval.json"))
-    samples = rerank(samples, model_dir="data/allmodels/model/bge-small-en")
-    json.dump(samples, open(f"{tmp_dir}/reranked.json", 'w'), indent=True)
-
-    return samples
-
-
-def create_question_prompt(sample, add_unsure=False):
-    prompt = "Based on above information answer the following question:"
-    question = f"Question : {sample[PROMPT]}"
-    abcde_s = [c for c in ABCDE]
-    # abcde_s = abcde_s[1:] + abcde_s[:1]
-    # random.shuffle(abcde_s)
-    answers = [f"\t{c}: {sample[c]}" for c in abcde_s]
-
-    if add_unsure:
-        answers.append("\tF: More information is required to answer this question correctly")
-
-    answers = "\n".join(answers)
-    qprompt = f"{prompt}\n{question}\n{answers}"
-    return qprompt
-
-
-def vicuna_prompt(prompt, expertise='science and technology'):
-    user = f"""You are an expert in {expertise}. \
-You will be given some paragraphs from wikipedia and a question related to it. \
-You have to chose one option from A,B,C,D,E. \
-Only one of the options is correct. \
-Sometimes the options are very close to each other. \
-All options will look like the correct option but would have some variation that would make them incorrect.
-\nUSER: {prompt}\n"""
-    assistant = """ASSISTANT: The correct choice in json format is:""" + '{"correct choice":"'
-    return user + assistant
-
-
-def tournament(all_choices):
-    choices = []
-    for rank in range(5):
-        current = [c[rank] for c in all_choices]
-        current = sorted(current, key=lambda x:x[0], reverse=True)
-        choices.extend(current)
-
-    winners = []
-    for c in choices:
-        c = c[1]
-        if c not in winners:
-            winners.append(c)
-
-    return winners
+def make_labels(example):
+    answer = example['answer']
+    example['label'] = ABCDE.index(answer)
+    for i in range(5):
+        example[str(i)] = example[ABCDE[i]]
+    return example
 
 
 def is_bad_passage(passage):
@@ -269,161 +60,150 @@ def is_bad_passage(passage):
     lines = passage.split("\n")
     n_words_per_line = len(words) / len(lines)
     isbad = (len(lines) >= 5) and (n_words_per_line <= 5)
-    # if isbad:
-    #     print("..............")
-    #     maxlen = max([len(line.split(" ")) for line in lines])
-    #     print(len(words))
-    #     print(len(lines))
+    if passage.count("|") > 10:
+        isbad = True
     return isbad
 
 
-def make_prompt(sample, llm, max_tokens=2048):
-    passages = sample[TIER_2_PASSAGES]
-
-    experts = {}
-    for passage in passages:
-        if is_bad_passage(passage[PASSAGE]):
+def make_context(example):
+    contexts = example["tier_2_passages"]
+    contexts = eval(contexts)
+    openbook = ""
+    max_openbook_len = 1024
+    for context in contexts:
+        tokens = tokenizer.encode(openbook)
+        if len(tokens) > max_openbook_len:
+            break
+        passage = context['passage']
+        if is_bad_passage(passage):
             continue
-        title = passage[TITLE]
-        experts[title] = experts.get(title, []) + [passage[PASSAGE]]
+        title = context['title']
+        passage = passage.replace("\n", " ")
+        lpassage = len(tokenizer.encode(passage))
+        if lpassage > 512:
+            print(passage)
+            continue
+        if lpassage + len(tokens) > max_openbook_len:
+            continue
+        openbook += f"""{title}: {passage}\n"""
 
-    openbook = "Here is some wikipedia excerpts that may help you answer:\n"
-    for idx, expertise in enumerate(experts):
-        information = experts[expertise]
-        information = ".".join(information)
-        information = information.replace("\n", " ")
-        openbook += f"""{idx}. {expertise}: {information}\n"""
+    example['context'] = openbook
+    return example
 
-    # print(openbook)
-    # print("--------------------")
-    openbook_tokens = llm.tokenizer.encode(openbook)
-    openbook_tokens = openbook_tokens[:max_tokens]
-    openbook = llm.tokenizer.decode(openbook_tokens)
-    # print(openbook)
-    # print("========================")
+@dataclass
+class DataCollatorForMultipleChoice:
+    """
+    Data collator that will dynamically pad the inputs for multiple choice received.
+    """
 
-    expertise = ",".join(list(experts.keys()))
+    tokenizer: PreTrainedTokenizerBase
+    padding: Union[bool, str, PaddingStrategy] = True
+    max_length: Optional[int] = None
+    pad_to_multiple_of: Optional[int] = None
 
-    p = create_question_prompt(sample, add_unsure=False)
-    p = f"{openbook}\n{p}"
-    p = vicuna_prompt(prompt=p, expertise=expertise)
-    return p
+    def __call__(self, features):
+        label_name = "label" if "label" in features[0].keys() else "labels"
+        labels = [feature.pop(label_name) for feature in features]
+        batch_size = len(features)
+        num_choices = len(features[0]["input_ids"])
+        flattened_features = [
+            [{k: v[i] for k, v in feature.items()} for i in range(num_choices)] for feature in features
+        ]
+        flattened_features = sum(flattened_features, [])
 
+        batch = self.tokenizer.pad(
+            flattened_features,
+            padding=self.padding,
+            max_length=self.max_length,
+            pad_to_multiple_of=self.pad_to_multiple_of,
+            return_tensors="pt",
+        )
 
-def inverse_permutation(permutation):
-    n = len(permutation)
-    inverse = [0] * n
-
-    for i in range(n):
-        inverse[permutation[i]] = i
-
-    return inverse
-
-
-def permute(sample, order):
-    correct_answer = sample[sample[ANSWER]]
-    answers = [sample[a] for a in ABCDE]
-    new_answers = [answers[i] for i in order]
-    new_correct_answer = ABCDE[new_answers.index(correct_answer)]
-
-    for i, c in enumerate(ABCDE):
-        sample[c] = new_answers[i]
-
-    sample[ANSWER] = new_correct_answer
-    return sample
+        batch = {k: v.view(batch_size, num_choices, -1) for k, v in batch.items()}
+        batch["labels"] = torch.tensor(labels, dtype=torch.int64)
+        return batch
 
 
-def apply_permutation(l, p):
-    ln = [l[i] for i in p]
-    return ln
+def map_at_3(predictions, labels):
+    map_sum = 0
+    pred = np.argsort(-1*np.array(predictions),axis=1)[:,:3]
+    for x,y in zip(pred,labels):
+        z = [1/i if y==j else 0 for i,j in zip([1,2,3],x)]
+        map_sum += np.sum(z)
+    return map_sum / len(predictions)
 
 
-def make_choices(samples):
-    from llm import GPTQLLM
-    from train_utils import apk
-
-    llm = GPTQLLM("data/allmodels/model/vicuna13b16k432/")
-    # llm = GPTQLLM("TheBloke/openchat_v3.2_super-GPTQ")
-    # llm = GPTQLLM("TheBloke/CodeLlama-13B-Instruct-GPTQ")
-    # llm = GPTQLLM("microsoft/phi-1_5")
-    # llm = GPTQLLM("TheBloke/CodeLlama-34B-Instruct-GPTQ")
-    # llm = GPTQLLM("TheBloke/vicuna-7B-v1.5-16K-GPTQ")
-
-    apks_3 = []
-    apks_1 = []
-
-    for sample in tqdm(samples):
-        # print("===========================")
-        answer_scores = {}
-        for run in range(1):
-        # for run in [-1, 1]:
-            # print("-----")
-            # Create a shift permutation by rotating the array
-            order = list(range(len(ABCDE)))
-            order = order[run:] + order[:run]
-            # order = order[::run]
-            # print(order)
-            inverse_order = inverse_permutation(order)
-
-            # What has abcde become now ?
-            new_abcde = apply_permutation(ABCDE, order)
-            mapping = dict(zip(ABCDE, new_abcde))
-
-            # apply the permutation to sample
-            sample = permute(sample, order)
-            prompt = make_prompt(sample, llm, max_tokens=1536)
-            # print(prompt)
-            choices = llm.process(prompt)
-            torch.cuda.empty_cache()
-
-            # if sample[ANSWER] != choices[0][1]:
-            #     print(sample['id'])
-            #     print(prompt)
-            #     print(choices)
-            #     print(sample[ANSWER])
-
-            # reverse the permutation
-            # collate the scores, against original
-            sample = permute(sample, inverse_order)
-            for choice in choices:
-                c = choice[1]
-                s = choice[0]
-                real_c = mapping[c]
-                answer_scores[real_c] = answer_scores.get(real_c, 0) + s
-
-        # who's the best ?
-        choices = sorted(answer_scores, key=answer_scores.get, reverse=True)
-
-        score_1 = apk([sample[ANSWER]], choices, k=1)
-        apks_1.append(score_1)
-
-        score_3 = apk([sample[ANSWER]], choices, k=3)
-        apks_3.append(score_3)
-
-        # print(choices, score_1, score_3)
-
-    print(sum(apks_1) / len(apks_1))
-    print(sum(apks_3) / len(apks_3))
+def compute_metrics(eval_pred):
+    predictions = eval_pred.predictions.tolist()
+    labels = eval_pred.label_ids.tolist()
+    return {"map@3": map_at_3(predictions, labels)}
 
 
-# data_df = pd.read_csv("data/extra/1000_science.csv")
-# data_df = pd.read_csv("data/kaggle-llm-science-exam/train.csv")
-# data_df = pd.read_csv("data/extra/openai_questions_kaggle/6000_wiki_en_sci_questions_with_excerpts.csv")
-data_df = pd.read_csv("data/extra/openai_questions_kaggle/6000_all_categories_questions_with_excerpts.csv")
+def predict(dataset):
+    model = AutoModelForMultipleChoice.from_pretrained(model_path, ignore_mismatched_sizes=True)
 
+    training_args = TrainingArguments(
+        output_dir="deberta_ft",
+        save_strategy="epoch",
+        # optim='adamw_bnb_8bit',
+        # max_grad_norm=0.3,
+        warmup_ratio=0.03,
+        # load_best_model_at_end=True,
+        gradient_checkpointing=True,
+        learning_rate=3e-5,
+        per_device_train_batch_size=4,
+        gradient_accumulation_steps=4,
+        per_device_eval_batch_size=1,
+        logging_steps=50,
+        eval_steps=100,
+        evaluation_strategy='steps',
+        max_steps=12020,
+        weight_decay=0.01,
+        lr_scheduler_type='cosine',
+        push_to_hub=False,
+        fp16=True,
+        tf32=True,
+        report_to=["none"],
+        dataloader_pin_memory=False
+    )
+
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        eval_dataset=dataset["validation"],
+        tokenizer=tokenizer,
+        data_collator=DataCollatorForMultipleChoice(tokenizer=tokenizer),
+        compute_metrics=compute_metrics,
+    )
+
+    test_predictions = trainer.predict(dataset["validation"]).predictions
+    predictions_as_ids = np.argsort(-test_predictions, 1)
+    predictions_as_answer_letters = np.array(list('ABCDE'))[predictions_as_ids]
+    return predictions_as_answer_letters
+
+tmp_dir = "working"
+dataset_path = f"{tmp_dir}/dataset/"
+os.makedirs(dataset_path, exist_ok=True)
+
+data_df = pd.read_csv("data/kaggle-llm-science-exam/train.csv")
 data_df.fillna("None of the above", inplace=True)
 data = data_df.to_dict(orient='records')
-# data = data[0:200]
-# #
-tmp_dir = "working_6k_nonsci"
-# tmp_dir = "working"
-#
+
 data = retrieve_and_rerank(data, tmp_dir=tmp_dir)
-# data = json.load(open(f"{tmp_dir}/reranked.json"))
-# # data = data[0:200]
+
+# make_dataset(reranked_json=f"{tmp_dir}/reranked.json",
+#                        dataset_path=f"{dataset_path}/validation.csv")
 #
-# with (torch.inference_mode(),
-#     torch.backends.cuda.sdp_kernel(enable_flash=True,
-#                                enable_math=False,
-#                                enable_mem_efficient=True)):
-#     make_choices(data)
+# dataset = load_dataset(dataset_path)
+# dataset = dataset.map(make_context)
+# dataset = dataset.map(make_labels)
+# dataset = dataset.map(preprocess_function, batched=True)
+# results = predict(dataset)
+#
+# map3 = 0
+# map1 = 0
+# from train_utils import apk
+# for total, (elem, result) in enumerate(zip(data, results)):
+#     map1 += apk([elem['answer']], result, k=1)
+#     map3 += apk([elem['answer']], result, k=3)
+#     print(map1/(total+1), map3/(total+1))
